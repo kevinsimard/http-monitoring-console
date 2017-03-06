@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+import argparse
+import curses
+import math
+import os
+import threading
+import time
+from collections import deque
+
+from pubsub import pub
+
+from src.monitoring.parser import LogEntryMonitoring
+from src.monitoring.traffic import HighTrafficMonitoring
+from src.utils.topic import TopicUtils
+from src.widgets.alert import AlertWindow
+from src.widgets.section import SectionWindow
+from src.widgets.stat import StatWindow
+
+
+class Monitor:
+    def __init__(self, file, threshold, section_exp, section_refresh):
+        self.file = file
+        self.threshold = threshold
+        self.section_exp = section_exp
+        self.section_refresh = section_refresh
+
+        self.alerts = deque()
+        self.entries = deque()
+        self.lock = threading.Lock()
+        self.total_entry_count = 0
+
+        pub.subscribe(self._on_new_entry, TopicUtils.NEW_ENTRY_TOPIC)
+        pub.subscribe(self._on_high_traffic_event, TopicUtils.HIGH_TRAFFIC_ALERT_TOPIC)
+        pub.subscribe(self._on_high_traffic_event, TopicUtils.HIGH_TRAFFIC_RECOVER_TOPIC)
+
+    def loop(self, stdscr):
+        max_y, max_x = stdscr.getmaxyx()
+
+        curses.curs_set(0)
+        curses.use_default_colors()
+
+        logentry_thread = LogEntryMonitoring(publisher=pub, file_path=self.file)
+        hightraffic_thread = HighTrafficMonitoring(publisher=pub, threshold=self.threshold, duration_s=self.section_exp)
+
+        stat_window_height = 7
+        half_window_width = math.floor(max_x / 2)
+
+        stat_window = StatWindow(stdscr.derwin(stat_window_height, half_window_width - 2, 0, 0),
+                                 file=self.file,
+                                 threshold=self.threshold,
+                                 duration_s=self.section_exp,
+                                 refresh_s=self.section_refresh)
+
+        alert_window = AlertWindow(
+            stdscr.derwin(max_y - stat_window_height - 1, half_window_width - 2, stat_window_height + 1, 1))
+
+        section_window = SectionWindow(
+            stdscr.derwin(max_y, half_window_width - 2, 0, half_window_width + 2))
+
+        hightraffic_thread.start()
+        logentry_thread.start()
+
+        last_sections_displayed = 0
+
+        while True:
+            stat_window.render(self.total_entry_count)
+            alert_window.render(self.alerts)
+
+            self._remove_expire_entries()
+
+            if time.time() - last_sections_displayed >= self.section_refresh:
+                section_window.render(self.entries)
+                last_sections_displayed = time.time()
+
+            time.sleep(0.5)
+
+    def _remove_expire_entries(self):
+        self.lock.acquire()
+        self.entries = [x for x in self.entries if not x.is_expired(self.section_exp)]
+        self.lock.release()
+
+    def _on_new_entry(self, entry):
+        self.total_entry_count += 1
+
+        if not entry.is_expired(self.section_exp):
+            self.lock.acquire()
+            self.entries.append(entry)
+            self.lock.release()
+
+    def _on_high_traffic_event(self, alert):
+        self.lock.acquire()
+        self.alerts.appendleft(alert)
+        self.lock.release()
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--file', type=str, default='access.log')
+    parser.add_argument('--threshold', type=int, default=100)
+    parser.add_argument('--section_expiration', type=int, default=120)
+    parser.add_argument('--section_refresh', type=int, default=10)
+    args = parser.parse_args()
+
+    try:
+        if not os.path.isfile(args.file):
+            raise FileNotFoundError
+
+        instance = Monitor(file=args.file,
+                           threshold=args.threshold,
+                           section_exp=args.section_expiration,
+                           section_refresh=args.section_refresh)
+
+        curses.wrapper(instance.loop)
+    except KeyboardInterrupt:
+        pass
+    except FileNotFoundError:
+        print('[%s] file not found' % args.file)
