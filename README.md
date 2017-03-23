@@ -68,7 +68,7 @@ usage: http-generator [-h] [--file FILE] [--per_second PER_SECOND]
     ├── .editorconfig
     ├── .gitattributes
     ├── .gitignore
-    ├── LICENSE.txt
+    ├── LICENSE.md
     ├── Makefile
     ├── README.md
     ├── requirements.txt
